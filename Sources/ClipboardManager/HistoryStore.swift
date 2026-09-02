@@ -18,6 +18,9 @@ enum CapturedContent {
 ///   图片 PNG 存同目录下的 `images/` 子目录。
 final class HistoryStore: ObservableObject {
 
+    static let maxTextBytes = 2 * 1024 * 1024
+    static let maxImageBytes = 64 * 1024 * 1024
+
     @Published private(set) var items: [ClipboardItem] = []
 
     /// 非置顶项的最大保留条数。
@@ -37,6 +40,7 @@ final class HistoryStore: ObservableObject {
 
     // 防抖写盘
     private var saveWorkItem: DispatchWorkItem?
+    private var allowSaving = true
 
     init(maxItems: Int = 200, baseDirectory: URL? = nil) {
         self.maxItems = maxItems
@@ -48,7 +52,14 @@ final class HistoryStore: ObservableObject {
         self.indexURL = storeDir.appendingPathComponent("history.json")
         self.imagesDir = storeDir.appendingPathComponent("images", isDirectory: true)
 
-        try? FileManager.default.createDirectory(at: imagesDir, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: imagesDir, withIntermediateDirectories: true)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: storeDir.path)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: imagesDir.path)
+        } catch {
+            NSLog("创建剪贴板历史目录失败: \(error)")
+            allowSaving = false
+        }
         load()
     }
 
@@ -90,22 +101,27 @@ final class HistoryStore: ObservableObject {
     // MARK: - 新增(来自监听器)
 
     /// 接收一次捕获到的内容。负责去重、移到顶部、图片落盘、容量淘汰。
-    func add(_ content: CapturedContent, sourceApp: String?) {
+    @discardableResult
+    func add(_ content: CapturedContent, sourceApp: String?) -> Bool {
+        switch content {
+        case .text(let value) where value.utf8.count > Self.maxTextBytes:
+            NSLog("忽略过大的剪贴板文本: \(value.utf8.count) bytes")
+            return false
+        case .image(let data, _) where data.count > Self.maxImageBytes:
+            NSLog("忽略过大的剪贴板图片: \(data.count) bytes")
+            return false
+        default:
+            break
+        }
+
         let (key, hash) = Self.dedupKey(for: content)
-
-        // 与最新一条相同 → 忽略,避免抖动
         if let first = items.first, first.dedupKey == key {
-            return
+            return true
         }
 
-        // 命中较旧的一条 → 移到顶部,保留其置顶状态
-        var inheritPinned = false
-        if let idx = items.firstIndex(where: { $0.dedupKey == key }) {
-            inheritPinned = items[idx].pinned
-            removeItem(at: idx)
-        }
+        let existingIndex = items.firstIndex(where: { $0.dedupKey == key })
+        let inheritPinned = existingIndex.map { items[$0].pinned } ?? false
 
-        // 构造新条目
         var newItem: ClipboardItem
         switch content {
         case .text(let s):
@@ -117,48 +133,81 @@ final class HistoryStore: ObservableObject {
             let url = imagesDir.appendingPathComponent(fileName)
             do {
                 try data.write(to: url, options: .atomic)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
                 newItem = ClipboardItem(id: item.id, kind: .image, sourceApp: sourceApp,
                                         imageFileName: fileName, imageHash: hash, pixelSize: pixelSize)
             } catch {
                 NSLog("写入图片失败: \(error)")
-                return
+                return false
             }
         case .files(let paths):
             newItem = ClipboardItem(kind: .file, sourceApp: sourceApp, fileURLs: paths)
         }
         newItem.pinned = inheritPinned
 
+        if let existingIndex {
+            removeItem(at: existingIndex)
+        }
         items.insert(newItem, at: 0)
         enforceCapacity()
         scheduleSave()
+        return true
     }
 
     // MARK: - 操作
 
-    /// 把某条写回系统剪贴板(供用户随后 ⌘V 粘贴)。
-    func copyToPasteboard(_ item: ClipboardItem) {
+    /// 把某条写回系统剪贴板(供用户随后 ⌘V 粘贴)。载荷不可用时保留原剪贴板。
+    @discardableResult
+    func copyToPasteboard(_ item: ClipboardItem) -> Bool {
         let pb = NSPasteboard.general
-        pb.clearContents()
+        let write: () -> Bool
         switch item.kind {
         case .text:
-            pb.setString(item.text ?? "", forType: .string)
+            guard let text = item.text else { return false }
+            write = { pb.setString(text, forType: .string) }
         case .image:
             if let img = image(for: item) {
-                pb.writeObjects([img])
+                write = { pb.writeObjects([img]) }
             } else if let url = imageURL(for: item), let data = try? Data(contentsOf: url) {
-                pb.setData(data, forType: .png)
+                write = { pb.setData(data, forType: .png) }
+            } else {
+                return false
             }
         case .file:
-            let urls = (item.fileURLs ?? []).map { NSURL(fileURLWithPath: $0) }
-            if !urls.isEmpty { pb.writeObjects(urls) }
+            let urls = (item.fileURLs ?? [])
+                .filter { FileManager.default.fileExists(atPath: $0) }
+                .map { NSURL(fileURLWithPath: $0) }
+            guard !urls.isEmpty else { return false }
+            write = { pb.writeObjects(urls) }
         }
-        // 告知监听器:这次变化是我们自己造成的,别记成新条目
+
+        let previousItems = (pb.pasteboardItems ?? []).map { original -> NSPasteboardItem in
+            let copy = NSPasteboardItem()
+            for type in original.types {
+                if let data = original.data(forType: type) {
+                    copy.setData(data, forType: type)
+                }
+            }
+            return copy
+        }
+        pb.clearContents()
+        guard write() else {
+            if !previousItems.isEmpty {
+                pb.clearContents()
+                _ = pb.writeObjects(previousItems)
+            }
+            return false
+        }
         pasteboardWriteHook?()
+        return true
     }
 
     func togglePin(_ item: ClipboardItem) {
         guard let idx = items.firstIndex(where: { $0.id == item.id }) else { return }
         items[idx].pinned.toggle()
+        if !items[idx].pinned {
+            enforceCapacity()
+        }
         scheduleSave()
     }
 
@@ -168,11 +217,15 @@ final class HistoryStore: ObservableObject {
         scheduleSave()
     }
 
-    /// 清空全部历史(含置顶)。
+    /// 清空全部历史(含置顶)。先持久化空索引,成功后再删图片。
     func clearAll() {
-        for item in items { deleteImageFileIfNeeded(item) }
+        let oldItems = items
         items.removeAll()
-        scheduleSave()
+        guard saveNow() else {
+            items = oldItems
+            return
+        }
+        for item in oldItems { deleteImageFileIfNeeded(item) }
     }
 
     // MARK: - 私有
@@ -227,20 +280,26 @@ final class HistoryStore: ObservableObject {
     }
 
     /// 立即写盘(退出前可调用)。
-    func saveNow() {
+    @discardableResult
+    func saveNow() -> Bool {
         saveWorkItem?.cancel()
-        save()
+        return save()
     }
 
-    private func save() {
+    @discardableResult
+    private func save() -> Bool {
+        guard allowSaving else { return false }
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
             let data = try encoder.encode(items)
             try data.write(to: indexURL, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: indexURL.path)
+            return true
         } catch {
             NSLog("保存历史失败: \(error)")
+            return false
         }
     }
 
@@ -262,6 +321,19 @@ final class HistoryStore: ObservableObject {
             items = loaded
         } catch {
             NSLog("加载历史失败: \(error)")
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyyMMdd-HHmmss"
+            let backup = storeDir.appendingPathComponent(
+                "history.corrupt-\(formatter.string(from: Date())).json"
+            )
+            do {
+                try FileManager.default.copyItem(at: indexURL, to: backup)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backup.path)
+            } catch {
+                NSLog("备份损坏历史失败,为防止覆盖已停用保存: \(error)")
+                allowSaving = false
+            }
         }
     }
 }

@@ -52,7 +52,7 @@ final class PopupPanel: NSPanel {
     func showPanel() {
         // 记录唤出前的前台 App(用于关闭后交还焦点 / 自动粘贴目标)
         let front = NSWorkspace.shared.frontmostApplication
-        if front != NSRunningApplication.current { previousApp = front }
+        previousApp = front != NSRunningApplication.current ? front : nil
 
         // 每次重建视图 → 重置搜索词与选中项,并触发搜索框重新抢焦点
         let root = HistoryView(
@@ -78,11 +78,14 @@ final class PopupPanel: NSPanel {
     /// 收起面板并把焦点交还给唤出前的前台 App(供自动粘贴前调用)。
     func dismissReturningFocus() {
         orderOut(nil)
-        if let prev = previousApp, prev != NSRunningApplication.current {
-            prev.activate(options: [.activateIgnoringOtherApps])
-        } else {
-            NSApp.hide(nil)
+        if let prev = previousApp,
+           !prev.isTerminated,
+           prev != NSRunningApplication.current,
+           prev.activate(options: [.activateIgnoringOtherApps]) {
+            return
         }
+        previousApp = nil
+        NSApp.hide(nil)
     }
 
     // MARK: 定位(鼠标所在屏幕的上方居中)

@@ -58,9 +58,9 @@ final class ClipboardMonitor {
 
         let sourceApp = NSWorkspace.shared.frontmostApplication?.localizedName
 
-        // 优先级:文件 > 图片 > 文本
-        if let content = readFiles(pb) ?? readImage(pb) ?? readText(pb) {
-            store.add(content, sourceApp: sourceApp)
+        // 同时存在临时 file-url 与像素数据时优先保留可持久化的图片。
+        if let content = readImage(pb) ?? readFiles(pb) ?? readText(pb) {
+            _ = store.add(content, sourceApp: sourceApp)
         }
     }
 
@@ -74,12 +74,14 @@ final class ClipboardMonitor {
     private func readImage(_ pb: NSPasteboard) -> CapturedContent? {
         // 统一规整成 PNG 落盘:优先直接取 PNG,否则把 TIFF 转 PNG。
         var png: Data?
-        if let d = pb.data(forType: .png) {
+        if let d = pb.data(forType: .png), d.count <= HistoryStore.maxImageBytes {
             png = d
-        } else if let tiff = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: tiff) {
+        } else if let tiff = pb.data(forType: .tiff),
+                  tiff.count <= HistoryStore.maxImageBytes,
+                  let rep = NSBitmapImageRep(data: tiff) {
             png = rep.representation(using: .png, properties: [:])
         }
-        guard let data = png else { return nil }
+        guard let data = png, data.count <= HistoryStore.maxImageBytes else { return nil }
 
         var pixelSize: String?
         if let rep = NSBitmapImageRep(data: data) {
@@ -89,7 +91,8 @@ final class ClipboardMonitor {
     }
 
     private func readText(_ pb: NSPasteboard) -> CapturedContent? {
-        guard let s = pb.string(forType: .string), !s.isEmpty else { return nil }
+        guard let s = pb.string(forType: .string), !s.isEmpty,
+              s.utf8.count <= HistoryStore.maxTextBytes else { return nil }
         return .text(s)
     }
 }

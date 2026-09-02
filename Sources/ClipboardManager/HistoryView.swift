@@ -371,11 +371,17 @@ struct SearchField: NSViewRepresentable {
             case #selector(NSResponder.cancelOperation(_:)):
                 parent.onCancel(); return true
             case #selector(NSResponder.deleteBackward(_:)):
-                // 搜索框为空时,⌫ 删除选中项;否则正常删字符
-                if parent.text.isEmpty { parent.onDelete(); return true }
+                // 搜索框为空时,只在首次按下删除选中项;忽略长按产生的重复事件。
+                if parent.text.isEmpty {
+                    if NSApp.currentEvent?.isARepeat != true { parent.onDelete() }
+                    return true
+                }
                 return false
             case #selector(NSResponder.deleteForward(_:)):
-                parent.onDelete(); return true
+                // 有搜索词时保持标准文本编辑行为;为空时与 ⌫ 一致且防重复。
+                if !parent.text.isEmpty { return false }
+                if NSApp.currentEvent?.isARepeat != true { parent.onDelete() }
+                return true
             default:
                 return false
             }

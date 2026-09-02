@@ -2,12 +2,12 @@ import AppKit
 import ServiceManagement
 
 /// 总装配:状态栏图标、全局快捷键、剪贴板监听、弹窗、右键菜单。
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var store: HistoryStore!
     private var monitor: ClipboardMonitor!
     private var panel: PopupPanel!
-    private var hotKey: HotKey!
+    private var hotKey: HotKey?
     private var statusItem: NSStatusItem!
 
     /// 选中后是否自动粘贴(默认开;需「辅助功能」权限)。
@@ -27,7 +27,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.chooseHandler = { [weak self] item in self?.handleChoose(item) }
 
         // 全局快捷键 ⌘⇧V
-        hotKey = HotKey { [weak self] in self?.panel.toggle() }
+        do {
+            hotKey = try HotKey { [weak self] in self?.panel.toggle() }
+        } catch {
+            DispatchQueue.main.async { [weak self] in
+                self?.presentError(error.localizedDescription)
+            }
+        }
 
         setupStatusItem()
 
@@ -49,26 +55,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: 选中处理(复制 +(可选)自动粘贴)
 
     private func handleChoose(_ item: ClipboardItem) {
-        store.copyToPasteboard(item)
+        guard store.copyToPasteboard(item) else {
+            panel.hidePanel()
+            presentError("该条目的原始内容已不可用，系统剪贴板未被修改。")
+            return
+        }
 
-        // 未开启自动粘贴 → 仅复制并把焦点交还
         guard autoPasteEnabled else {
             panel.hidePanel()
             return
         }
 
-        // 开了自动粘贴但未授权 → 复制成功,交还焦点供手动 ⌘V,并引导授权
         guard AutoPaster.isTrusted() else {
             panel.dismissReturningFocus()
             promptAccessibilityIfNeeded()
             return
         }
 
-        // 收起面板并把焦点交还前台 App,稍等其重新成为响应者后再合成 ⌘V
-        panel.dismissReturningFocus()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-            AutoPaster.paste()
+        guard let target = panel.previousApp,
+              !target.isTerminated,
+              target != NSRunningApplication.current else {
+            panel.hidePanel()
+            return
         }
+        panel.dismissReturningFocus()
+        AutoPaster.paste(whenActive: target)
     }
 
     private func promptAccessibilityIfNeeded() {
@@ -170,10 +181,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         for item in menu.items where item.action != nil { item.target = self }
 
-        // 临时挂上菜单并弹出,弹完清空,保证下次左键仍是「打开面板」
+        // 临时挂上菜单；等 menuDidClose 再解绑，避免状态栏按钮残留高亮吞掉下次左键。
+        menu.delegate = self
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        guard statusItem.menu === menu else { return }
         statusItem.menu = nil
+        statusItem.button?.highlight(false)
     }
 
     // MARK: 菜单动作

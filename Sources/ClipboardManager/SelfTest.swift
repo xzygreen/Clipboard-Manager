@@ -40,6 +40,11 @@ enum SelfTest {
         store.add(.text("e"), sourceApp: nil)
         store.add(.text("f"), sourceApp: nil)
         check(store.items.contains { $0.text == "c" && $0.pinned }, "置顶项不被容量淘汰")
+        if let c = store.items.first(where: { $0.text == "c" }) { store.togglePin(c) }
+        check(store.items.filter { !$0.pinned }.count <= 3, "取消置顶后立即恢复容量上限")
+
+        let oversized = String(repeating: "x", count: HistoryStore.maxTextBytes + 1)
+        check(!store.add(.text(oversized), sourceApp: nil), "拒绝超过大小上限的文本")
 
         // --- 图片:按内容哈希去重 + 落盘 + 持久化往返 ---
         let mediaDir = tmp.appendingPathComponent("media")

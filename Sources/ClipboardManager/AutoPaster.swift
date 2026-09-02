@@ -1,34 +1,66 @@
 import AppKit
-import CoreGraphics
 import ApplicationServices
+import CoreGraphics
 
-/// 模拟 ⌘V 把当前剪贴板内容粘贴到前台 App,以及辅助功能(Accessibility)权限的检查/申请。
-///
-/// 合成按键(`CGEvent.post`)需要系统「辅助功能」授权,否则按键会被静默丢弃。
+/// 模拟 ⌘V 把当前剪贴板内容粘贴到指定 App,以及辅助功能权限的检查/申请。
 enum AutoPaster {
-
-    /// 本进程是否已获得辅助功能授权。
     static func isTrusted() -> Bool {
         AXIsProcessTrusted()
     }
 
-    /// 申请授权:若未授权,弹出系统提示把本 App 加入「辅助功能」列表。
     @discardableResult
     static func requestPermission() -> Bool {
-        // key 即 kAXTrustedCheckOptionPrompt 的字符串值,硬编码可避开 Unmanaged 桥接的写法差异。
         let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
         return AXIsProcessTrustedWithOptions(options)
     }
 
-    /// 合成一次 ⌘V。
-    static func paste() {
-        guard let src = CGEventSource(stateID: .combinedSessionState) else { return }
-        let vKey = CGKeyCode(9)   // kVK_ANSI_V
-        guard let down = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: true),
-              let up = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: false) else { return }
+    /// 等指定 App 真正回到前台后再粘贴。激活失败或超时只保留已复制内容,绝不粘到别处。
+    static func paste(
+        whenActive target: NSRunningApplication,
+        timeout: TimeInterval = 1.2,
+        completion: ((Bool) -> Void)? = nil
+    ) {
+        guard isTrusted(), !target.isTerminated,
+              target != NSRunningApplication.current else {
+            completion?(false)
+            return
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        _ = target.activate(options: [.activateIgnoringOtherApps])
+
+        func attempt() {
+            guard !target.isTerminated else {
+                completion?(false)
+                return
+            }
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier {
+                completion?(postPaste())
+                return
+            }
+            guard Date() < deadline else {
+                completion?(false)
+                return
+            }
+            _ = target.activate(options: [.activateIgnoringOtherApps])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: attempt)
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: attempt)
+    }
+
+    @discardableResult
+    private static func postPaste() -> Bool {
+        guard let source = CGEventSource(stateID: .privateState) else { return false }
+        let vKey = CGKeyCode(9)
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: false) else {
+            return false
+        }
         down.flags = .maskCommand
         up.flags = .maskCommand
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
+        return true
     }
 }
